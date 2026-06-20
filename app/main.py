@@ -136,6 +136,12 @@ class RenderRequest(BaseModel):
     width: int = Field(default=1080)
     height: int = Field(default=1920)
     fps: int = Field(default=30)
+    transition: str = Field(
+        default="fade", description="Transición entre escenas (xfade) o 'none'."
+    )
+    transition_duration: float = Field(default=0.5, description="Duración de la transición (s).")
+    ken_burns: bool = Field(default=True, description="Movimiento Ken Burns (zoom/pan lento).")
+    motion_intensity: float = Field(default=0.12, description="Cuánto zoom del Ken Burns (0.12 = +12%).")
 
 
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
@@ -165,20 +171,12 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
         shutil.rmtree(job_dir, ignore_errors=True)
 
     try:
-        # 1) Guardar imágenes y construir la lista del concat demuxer.
-        concat_lines: List[str] = []
+        # 1) Guardar imágenes.
         for idx, item in enumerate(req.images):
             data = await _fetch_image_bytes(item)
-            fname = f"img_{idx:03d}.png"
-            with open(os.path.join(job_dir, fname), "wb") as fh:
+            with open(os.path.join(job_dir, f"img_{idx:03d}.png"), "wb") as fh:
                 fh.write(data)
-            concat_lines.append(f"file '{fname}'")
-            concat_lines.append(f"duration {max(0.1, item.duration_sec)}")
-        # El concat demuxer exige repetir el último archivo sin 'duration'.
-        last = f"img_{len(req.images) - 1:03d}.png"
-        concat_lines.append(f"file '{last}'")
-        with open(os.path.join(job_dir, "list.txt"), "w") as fh:
-            fh.write("\n".join(concat_lines) + "\n")
+        n = len(req.images)
 
         # 2) Audio (opcional).
         has_audio = bool(req.audio_b64)
@@ -192,25 +190,79 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             with open(os.path.join(job_dir, "subs.ass"), "w", encoding="utf-8") as fh:
                 fh.write(req.subtitles_ass)
 
-        # 4) Filtro de video: cubrir 9:16 (scale+crop), fps fijo, opcional subtítulos.
-        vf = (
-            f"scale={req.width}:{req.height}:force_original_aspect_ratio=increase,"
-            f"crop={req.width}:{req.height},setsar=1,fps={req.fps},format=yuv420p"
-        )
-        if has_subs:
-            vf += ",subtitles=subs.ass"
+        W, H, FPS = req.width, req.height, req.fps
+        TD = max(0.0, req.transition_duration)
+        durations = [max(0.6, it.duration_sec) for it in req.images]
+        use_xfade = bool(req.transition) and req.transition != "none" and n > 1
 
-        # 5) Comando ffmpeg. CPU débil -> preset veryfast.
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", "list.txt",
-        ]
+        # 4) Inputs: cada imagen en bucle por su duración (frames a FPS fijo).
+        cmd = ["ffmpeg", "-y"]
+        for idx in range(n):
+            cmd += [
+                "-loop", "1", "-framerate", str(FPS),
+                "-t", f"{durations[idx]:.3f}", "-i", f"img_{idx:03d}.png",
+            ]
         if has_audio:
             cmd += ["-i", "audio.mp3"]
-        cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+
+        # 5) Filtro por imagen: cover 9:16 + Ken Burns (zoom alternado in/out).
+        filters: List[str] = []
+        for idx in range(n):
+            frames = max(1, int(round(durations[idx] * FPS)))
+            if req.ken_burns:
+                k = req.motion_intensity / frames  # por frame para llegar a +intensity
+                if idx % 2 == 0:
+                    zexpr = f"min(1+on*{k:.6f},{1 + req.motion_intensity:.3f})"
+                else:
+                    zexpr = f"max({1 + req.motion_intensity:.3f}-on*{k:.6f},1.0)"
+                filt = (
+                    f"[{idx}:v]scale={W*2}:{H*2}:force_original_aspect_ratio=increase,"
+                    f"crop={W*2}:{H*2},"
+                    f"zoompan=z='{zexpr}':d=1:s={W}x{H}:fps={FPS}:"
+                    f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
+                    f"setsar=1,format=yuv420p[v{idx}]"
+                )
+            else:
+                filt = (
+                    f"[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                    f"crop={W}:{H},fps={FPS},setsar=1,format=yuv420p[v{idx}]"
+                )
+            filters.append(filt)
+
+        # 6) Combinar: xfade encadenado, concat, o passthrough.
+        if n == 1:
+            last_label = "[v0]"
+        elif use_xfade:
+            timeline = durations[0]
+            prev = "[v0]"
+            for i in range(1, n):
+                offset = max(0.0, timeline - TD)
+                out = f"[x{i}]"
+                filters.append(
+                    f"{prev}[v{i}]xfade=transition={req.transition}:"
+                    f"duration={TD}:offset={offset:.3f}{out}"
+                )
+                timeline = timeline + durations[i] - TD
+                prev = out
+            last_label = prev
+        else:
+            joined = "".join(f"[v{i}]" for i in range(n))
+            filters.append(f"{joined}concat=n={n}:v=1:a=0[cv]")
+            last_label = "[cv]"
+
+        # 7) Subtítulos quemados sobre el resultado final.
+        if has_subs:
+            filters.append(f"{last_label}subtitles=subs.ass[vout]")
+        else:
+            filters.append(f"{last_label}null[vout]")
+
+        cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]"]
         if has_audio:
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
-        cmd += ["-movflags", "+faststart", "output.mp4"]
+            cmd += ["-map", f"{n}:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+        cmd += [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "output.mp4",
+        ]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
