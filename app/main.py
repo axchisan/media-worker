@@ -13,6 +13,7 @@ el header `X-API-Key` con ese valor en /tts y /render.
 
 import asyncio
 import base64
+import io
 import os
 import shutil
 import uuid
@@ -20,6 +21,7 @@ from typing import List, Optional
 
 import edge_tts
 import httpx
+from PIL import Image, ImageDraw, ImageFont
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -146,6 +148,7 @@ class Panel(BaseModel):
     """Tarjeta de apoyo (chart/diagrama/imagen) centrada y temporizada por escena."""
     chart: Optional[dict] = Field(default=None, description="Config Chart.js (QuickChart).")
     mermaid: Optional[str] = Field(default=None, description="Código Mermaid (Kroki).")
+    title: Optional[str] = Field(default=None, description="Título mostrado en la barra de la tarjeta.")
     url: Optional[str] = Field(default=None, description="URL de una imagen de apoyo.")
     b64: Optional[str] = Field(default=None, description="Imagen de apoyo en base64.")
     start_sec: float = Field(default=0.0)
@@ -186,6 +189,50 @@ async def _fetch_image_bytes(item: ImageItem) -> bytes:
     raise HTTPException(status_code=400, detail="Cada imagen requiere 'b64' o 'url'.")
 
 
+def _load_font(size: int):
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_card(png_bytes: bytes, title: Optional[str] = None) -> bytes:
+    """Envuelve un PNG en una tarjeta blanca redondeada con barra de marca y título (legibilidad/coherencia)."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    max_w = 980
+    if img.width > max_w:
+        ratio = max_w / img.width
+        img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+    w, h = img.size
+    pad, radius = 44, 36
+    top_bar = 70 if title else 26
+    cw, ch = w + 2 * pad, h + 2 * pad + top_bar
+    card = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle([0, 0, cw - 1, ch - 1], radius=radius,
+                           fill=(249, 250, 252, 255), outline=(30, 102, 245, 255), width=5)
+    draw.rounded_rectangle([0, 0, cw - 1, top_bar + radius], radius=radius, fill=(30, 102, 245, 255))
+    draw.rectangle([0, top_bar, cw - 1, top_bar + radius], fill=(249, 250, 252, 255))
+    if title:
+        t = str(title)[:64]
+        fs = 38
+        font = _load_font(fs)
+        while draw.textlength(t, font=font) > cw - 50 and fs > 18:
+            fs -= 2
+            font = _load_font(fs)
+        tw = draw.textlength(t, font=font)
+        draw.text(((cw - tw) / 2, max(6, (top_bar - fs) / 2 - 2)), t, fill=(255, 255, 255, 255), font=font)
+    card.alpha_composite(img, (pad, top_bar + pad // 2))
+    out = io.BytesIO()
+    card.save(out, format="PNG")
+    return out.getvalue()
+
+
 async def _render_panel_bytes(seg: "Panel") -> bytes:
     """Renderiza una tarjeta de apoyo a PNG: chart (QuickChart), mermaid (Kroki), url o b64."""
     if seg.b64:
@@ -193,13 +240,13 @@ async def _render_panel_bytes(seg: "Panel") -> bytes:
     async with httpx.AsyncClient(timeout=45) as client:
         if seg.chart is not None:
             payload = {
-                "width": 1000, "height": 750,
+                "width": 1000, "height": 720,
                 "backgroundColor": "white", "format": "png",
                 "chart": seg.chart,
             }
             r = await client.post("https://quickchart.io/chart", json=payload)
             r.raise_for_status()
-            return r.content
+            return _wrap_card(r.content, seg.title)
         if seg.mermaid:
             r = await client.post(
                 "https://kroki.io/mermaid/png",
@@ -207,7 +254,7 @@ async def _render_panel_bytes(seg: "Panel") -> bytes:
                 headers={"Content-Type": "text/plain"},
             )
             r.raise_for_status()
-            return r.content
+            return _wrap_card(r.content, seg.title)
         if seg.url:
             r = await client.get(seg.url)
             r.raise_for_status()
@@ -299,10 +346,12 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
         music_on = req.background_music and os.path.exists(MUSIC_PATH)
         if music_on:
             cmd += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+        # Acotar los inputs de overlay (infinitos) a la duración total para no colgar sin audio.
+        total_in = sum(durations)
         for fname, _seg in mascot_files:
-            cmd += ["-stream_loop", "-1", "-i", fname]
+            cmd += ["-stream_loop", "-1", "-t", f"{total_in:.3f}", "-i", fname]
         for pname, _pseg in panel_files:
-            cmd += ["-loop", "1", "-framerate", str(FPS), "-i", pname]
+            cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{total_in:.3f}", "-i", pname]
 
         # 5) Filtro por imagen: cover 9:16 + Ken Burns (zoom alternado in/out).
         filters: List[str] = []
