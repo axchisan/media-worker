@@ -32,6 +32,8 @@ from starlette.background import BackgroundTask
 
 API_KEY = os.environ.get("MEDIA_WORKER_API_KEY", "").strip()
 PEXELS_KEY = os.environ.get("PEXELS_KEY", "").strip()
+ELEVENLABS_KEY = os.environ.get("ELEVENLABS_KEY", "").strip()
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 JOBS_DIR = "/tmp/jobs"
 # Voz por defecto: español LatAm (decisión de marca: es-MX-JorgeNeural).
 DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
@@ -64,7 +66,8 @@ async def health():
 # --------------------------------------------------------------------------- #
 class TTSRequest(BaseModel):
     text: str = Field(..., description="Texto a narrar.")
-    voice: str = Field(default=DEFAULT_VOICE, description="Voz de edge-tts.")
+    provider: str = Field(default="edge", description="'edge' (edge-tts) o 'elevenlabs'.")
+    voice: str = Field(default=DEFAULT_VOICE, description="Voz: nombre edge-tts o voice_id de ElevenLabs.")
     rate: str = Field(default="+0%", description="Velocidad, p.ej. '+10%'.")
     pitch: str = Field(default="+0Hz", description="Tono, p.ej. '+2Hz'.")
     volume: str = Field(default="+0%", description="Volumen, p.ej. '+0%'.")
@@ -74,6 +77,57 @@ class TTSRequest(BaseModel):
     )
 
 
+async def _mp3_duration_ms(audio: bytes) -> Optional[float]:
+    """Duración real del audio (ms) vía ffprobe sobre los bytes."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "csv=p=0", "-i", "pipe:0",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate(input=audio)
+        val = float(out.decode().strip())
+        return val * 1000 if val > 0 else None
+    except Exception:
+        return None
+
+
+async def _elevenlabs_tts(text: str, voice_id: str):
+    """TTS con ElevenLabs (con timestamps) → (audio_bytes, words[])."""
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+    payload = {"text": text, "model_id": ELEVENLABS_MODEL}
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            url, headers={"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        r.raise_for_status()
+        d = r.json()
+    audio = base64.b64decode(d["audio_base64"])
+    al = d.get("alignment") or {}
+    chars = al.get("characters", [])
+    st = al.get("character_start_times_seconds", [])
+    en = al.get("character_end_times_seconds", [])
+    words: List[dict] = []
+    cur, cur_start, cur_end = "", None, None
+    for i, ch in enumerate(chars):
+        if ch in (" ", "\n", "\t"):
+            if cur.strip() and cur_start is not None:
+                words.append({"text": cur.strip(), "offset_ms": cur_start * 1000,
+                              "duration_ms": (cur_end - cur_start) * 1000})
+            cur, cur_start = "", None
+        else:
+            if cur_start is None:
+                cur_start = st[i]
+            cur_end = en[i]
+            cur += ch
+    if cur.strip() and cur_start is not None:
+        words.append({"text": cur.strip(), "offset_ms": cur_start * 1000,
+                      "duration_ms": (cur_end - cur_start) * 1000})
+    return audio, words
+
+
 @app.post("/tts")
 async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
     """Genera narración MP3 y devuelve audio (base64) + timing por palabra."""
@@ -81,6 +135,23 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
 
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="El campo 'text' está vacío.")
+
+    # --- ElevenLabs (voz expresiva del canal) ---
+    if req.provider == "elevenlabs" and ELEVENLABS_KEY:
+        try:
+            audio, el_words = await _elevenlabs_tts(req.text, req.voice)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Fallo en ElevenLabs: {exc}")
+        dur_ms = (el_words[-1]["offset_ms"] + el_words[-1]["duration_ms"]) if el_words else None
+        real_ms = await _mp3_duration_ms(audio) or dur_ms
+        return JSONResponse({
+            "mime": "audio/mpeg",
+            "audio_b64": base64.b64encode(audio).decode("ascii"),
+            "duration_ms": dur_ms,
+            "audio_duration_ms": real_ms,
+            "voice": req.voice,
+            "words": el_words,
+        })
 
     communicate = edge_tts.Communicate(
         req.text,
