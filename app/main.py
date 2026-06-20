@@ -21,7 +21,7 @@ from typing import List, Optional
 
 import edge_tts
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name, guess_lexer
 from pygments.formatters import ImageFormatter
@@ -154,7 +154,28 @@ class ImageItem(BaseModel):
     b64: Optional[str] = Field(default=None, description="Imagen en base64.")
     url: Optional[str] = Field(default=None, description="URL de la imagen.")
     pexels: Optional[str] = Field(default=None, description="Query para buscar una foto real en Pexels (b-roll).")
+    gradient: Optional[bool] = Field(default=None, description="Generar un fondo degradado limpio de marca.")
     duration_sec: float = Field(default=3.0, description="Segundos en pantalla.")
+
+
+def _gradient_bg(w: int = 1080, h: int = 1920) -> bytes:
+    """Fondo degradado oscuro de marca (limpio, para que las tarjetas/gráficos resalten)."""
+    top, bottom = (16, 20, 38), (30, 52, 102)  # navy -> azul de marca
+    col = Image.new("RGB", (1, 256))
+    for y in range(256):
+        tt = y / 255.0
+        col.putpixel((0, y), tuple(int(top[i] + (bottom[i] - top[i]) * tt) for i in range(3)))
+    img = col.resize((w, h))
+    # viñeta sutil + glow central para dar profundidad
+    glow = Image.new("L", (w, h), 0)
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([int(w * 0.1), int(h * 0.15), int(w * 0.9), int(h * 0.7)], fill=46)
+    glow = glow.filter(ImageFilter.GaussianBlur(160))
+    overlay = Image.new("RGB", (w, h), (90, 130, 220))
+    img = Image.composite(overlay, img, glow)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
 
 
 class MascotSeg(BaseModel):
@@ -225,6 +246,8 @@ async def _pexels_photo_bytes(query: str) -> Optional[bytes]:
 
 
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
+    if item.gradient:
+        return _gradient_bg()
     if item.pexels:
         data = await _pexels_photo_bytes(item.pexels)
         if data:
@@ -495,7 +518,7 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
                 pos = f"W-w-{m}:H-h-{m}"
             # Clip "alfa empacado": color arriba, máscara alfa (gris) abajo.
             filters.append(f"[{midx}:v]split=2[c{k}][a{k}]")
-            filters.append(f"[c{k}]crop=iw:ih/2:0:0[col{k}]")
+            filters.append(f"[c{k}]crop=iw:ih/2:0:0,eq=saturation=1.6:contrast=1.08[col{k}]")
             filters.append(f"[a{k}]crop=iw:ih/2:0:ih/2,format=gray[alp{k}]")
             filters.append(f"[col{k}][alp{k}]alphamerge,scale=-1:{th}[mk{k}]")
             out = f"[mov{k}]"
