@@ -27,8 +27,12 @@ from starlette.background import BackgroundTask
 
 API_KEY = os.environ.get("MEDIA_WORKER_API_KEY", "").strip()
 JOBS_DIR = "/tmp/jobs"
-# Voz por defecto: español LatAm (decisión de marca de Fase 0).
-DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-CO-GonzaloNeural")
+# Voz por defecto: español LatAm (decisión de marca: es-MX-JorgeNeural).
+DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
+# Música de fondo del canal (CC-BY, ver assets/music/CREDITS.md).
+MUSIC_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "assets", "music", "carefree.mp3")
+)
 
 app = FastAPI(title="media-worker", version="0.1.0")
 
@@ -142,6 +146,8 @@ class RenderRequest(BaseModel):
     transition_duration: float = Field(default=0.5, description="Duración de la transición (s).")
     ken_burns: bool = Field(default=True, description="Movimiento Ken Burns (zoom/pan lento).")
     motion_intensity: float = Field(default=0.12, description="Cuánto zoom del Ken Burns (0.12 = +12%).")
+    background_music: bool = Field(default=True, description="Mezclar música de fondo del canal (CC-BY).")
+    music_volume: float = Field(default=0.18, description="Volumen de la música respecto a la narración.")
 
 
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
@@ -204,6 +210,9 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             ]
         if has_audio:
             cmd += ["-i", "audio.mp3"]
+        music_on = req.background_music and os.path.exists(MUSIC_PATH)
+        if music_on:
+            cmd += ["-stream_loop", "-1", "-i", MUSIC_PATH]
 
         # 5) Filtro por imagen: cover 9:16 + Ken Burns (zoom alternado in/out).
         filters: List[str] = []
@@ -256,9 +265,24 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
         else:
             filters.append(f"{last_label}null[vout]")
 
+        # 8) Audio: narración + música de fondo (volumen bajo) vía amix.
+        music_idx = (n + 1) if has_audio else n
+        audio_map: Optional[str] = None
+        if has_audio and music_on:
+            filters.append(
+                f"[{music_idx}:a]volume={req.music_volume}[mus];"
+                f"[{n}:a][mus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+            )
+            audio_map = "[aout]"
+        elif has_audio:
+            audio_map = f"{n}:a"
+        elif music_on:
+            filters.append(f"[{music_idx}:a]volume={req.music_volume}[aout]")
+            audio_map = "[aout]"
+
         cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]"]
-        if has_audio:
-            cmd += ["-map", f"{n}:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+        if audio_map:
+            cmd += ["-map", audio_map, "-c:a", "aac", "-b:a", "128k", "-shortest"]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "output.mp4",

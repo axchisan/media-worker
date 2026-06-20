@@ -17,6 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY assets ./assets
 
 # Directorio de trabajo temporal para render (se limpia tras cada job).
 RUN mkdir -p /tmp/jobs
