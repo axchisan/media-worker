@@ -131,6 +131,17 @@ class ImageItem(BaseModel):
     duration_sec: float = Field(default=3.0, description="Segundos en pantalla.")
 
 
+class MascotSeg(BaseModel):
+    """Un clip de mascota (con alfa) a superponer durante una ventana de tiempo."""
+    url: Optional[str] = Field(default=None, description="URL del clip de mascota (mp4 'alfa empacado': color arriba, alfa abajo).")
+    b64: Optional[str] = Field(default=None, description="Clip de mascota en base64 (mismo formato empacado).")
+    start_sec: float = Field(default=0.0, description="Inicio del overlay (s).")
+    end_sec: float = Field(default=99999.0, description="Fin del overlay (s).")
+    corner: str = Field(default="br", description="Esquina: br, bl, tr, tl.")
+    scale: float = Field(default=0.34, description="Alto del clip como fracción del alto del video.")
+    margin: int = Field(default=40, description="Margen en px desde el borde.")
+
+
 class RenderRequest(BaseModel):
     images: List[ImageItem] = Field(..., description="Imágenes en orden.")
     audio_b64: Optional[str] = Field(default=None, description="Narración MP3 base64.")
@@ -148,6 +159,7 @@ class RenderRequest(BaseModel):
     motion_intensity: float = Field(default=0.12, description="Cuánto zoom del Ken Burns (0.12 = +12%).")
     background_music: bool = Field(default=True, description="Mezclar música de fondo del canal (CC-BY).")
     music_volume: float = Field(default=0.18, description="Volumen de la música respecto a la narración.")
+    mascots: List[MascotSeg] = Field(default_factory=list, description="Clips de mascota (alfa) a superponer.")
 
 
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
@@ -196,6 +208,26 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             with open(os.path.join(job_dir, "subs.ass"), "w", encoding="utf-8") as fh:
                 fh.write(req.subtitles_ass)
 
+        # 3b) Clips de mascota (opcional, .mov con alfa).
+        mascot_files: List[tuple] = []  # (filename, seg)
+        for k, seg in enumerate(req.mascots):
+            try:
+                if seg.b64:
+                    data = base64.b64decode(seg.b64)
+                elif seg.url:
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        r = await client.get(seg.url)
+                        r.raise_for_status()
+                        data = r.content
+                else:
+                    continue
+                fname = f"mascot_{k}.mp4"
+                with open(os.path.join(job_dir, fname), "wb") as fh:
+                    fh.write(data)
+                mascot_files.append((fname, seg))
+            except Exception:
+                continue
+
         W, H, FPS = req.width, req.height, req.fps
         TD = max(0.0, req.transition_duration)
         durations = [max(0.6, it.duration_sec) for it in req.images]
@@ -213,6 +245,8 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
         music_on = req.background_music and os.path.exists(MUSIC_PATH)
         if music_on:
             cmd += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+        for fname, _seg in mascot_files:
+            cmd += ["-stream_loop", "-1", "-i", fname]
 
         # 5) Filtro por imagen: cover 9:16 + Ken Burns (zoom alternado in/out).
         filters: List[str] = []
@@ -258,6 +292,33 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             joined = "".join(f"[v{i}]" for i in range(n))
             filters.append(f"{joined}concat=n={n}:v=1:a=0[cv]")
             last_label = "[cv]"
+
+        # 6b) Overlay de mascota(s) con alfa, sobre las escenas (debajo de subtítulos).
+        base_m = n + (1 if has_audio else 0) + (1 if music_on else 0)
+        cur = last_label
+        for k, (fname, seg) in enumerate(mascot_files):
+            midx = base_m + k
+            th = max(2, int(H * seg.scale))
+            m = seg.margin
+            if seg.corner == "bl":
+                pos = f"{m}:H-h-{m}"
+            elif seg.corner == "tr":
+                pos = f"W-w-{m}:{m}"
+            elif seg.corner == "tl":
+                pos = f"{m}:{m}"
+            else:  # br por defecto
+                pos = f"W-w-{m}:H-h-{m}"
+            # Clip "alfa empacado": color arriba, máscara alfa (gris) abajo.
+            filters.append(f"[{midx}:v]split=2[c{k}][a{k}]")
+            filters.append(f"[c{k}]crop=iw:ih/2:0:0[col{k}]")
+            filters.append(f"[a{k}]crop=iw:ih/2:0:ih/2,format=gray[alp{k}]")
+            filters.append(f"[col{k}][alp{k}]alphamerge,scale=-1:{th}[mk{k}]")
+            out = f"[mov{k}]"
+            filters.append(
+                f"{cur}[mk{k}]overlay={pos}:enable='between(t,{seg.start_sec},{seg.end_sec})'{out}"
+            )
+            cur = out
+        last_label = cur
 
         # 7) Subtítulos quemados sobre el resultado final.
         if has_subs:
