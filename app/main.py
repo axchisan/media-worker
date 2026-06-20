@@ -142,6 +142,18 @@ class MascotSeg(BaseModel):
     margin: int = Field(default=40, description="Margen en px desde el borde.")
 
 
+class Panel(BaseModel):
+    """Tarjeta de apoyo (chart/diagrama/imagen) centrada y temporizada por escena."""
+    chart: Optional[dict] = Field(default=None, description="Config Chart.js (QuickChart).")
+    mermaid: Optional[str] = Field(default=None, description="Código Mermaid (Kroki).")
+    url: Optional[str] = Field(default=None, description="URL de una imagen de apoyo.")
+    b64: Optional[str] = Field(default=None, description="Imagen de apoyo en base64.")
+    start_sec: float = Field(default=0.0)
+    end_sec: float = Field(default=99999.0)
+    width_frac: float = Field(default=0.84, description="Ancho del panel como fracción del ancho.")
+    y_frac: float = Field(default=0.24, description="Posición vertical (fracción del alto, desde arriba).")
+
+
 class RenderRequest(BaseModel):
     images: List[ImageItem] = Field(..., description="Imágenes en orden.")
     audio_b64: Optional[str] = Field(default=None, description="Narración MP3 base64.")
@@ -160,6 +172,7 @@ class RenderRequest(BaseModel):
     background_music: bool = Field(default=True, description="Mezclar música de fondo del canal (CC-BY).")
     music_volume: float = Field(default=0.18, description="Volumen de la música respecto a la narración.")
     mascots: List[MascotSeg] = Field(default_factory=list, description="Clips de mascota (alfa) a superponer.")
+    panels: List[Panel] = Field(default_factory=list, description="Tarjetas de apoyo (chart/diagrama/imagen) por escena.")
 
 
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
@@ -171,6 +184,35 @@ async def _fetch_image_bytes(item: ImageItem) -> bytes:
             resp.raise_for_status()
             return resp.content
     raise HTTPException(status_code=400, detail="Cada imagen requiere 'b64' o 'url'.")
+
+
+async def _render_panel_bytes(seg: "Panel") -> bytes:
+    """Renderiza una tarjeta de apoyo a PNG: chart (QuickChart), mermaid (Kroki), url o b64."""
+    if seg.b64:
+        return base64.b64decode(seg.b64)
+    async with httpx.AsyncClient(timeout=45) as client:
+        if seg.chart is not None:
+            payload = {
+                "width": 1000, "height": 750,
+                "backgroundColor": "white", "format": "png",
+                "chart": seg.chart,
+            }
+            r = await client.post("https://quickchart.io/chart", json=payload)
+            r.raise_for_status()
+            return r.content
+        if seg.mermaid:
+            r = await client.post(
+                "https://kroki.io/mermaid/png",
+                content=seg.mermaid.encode("utf-8"),
+                headers={"Content-Type": "text/plain"},
+            )
+            r.raise_for_status()
+            return r.content
+        if seg.url:
+            r = await client.get(seg.url)
+            r.raise_for_status()
+            return r.content
+    raise ValueError("panel sin contenido")
 
 
 @app.post("/render")
@@ -228,6 +270,18 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             except Exception:
                 continue
 
+        # 3c) Tarjetas de apoyo (chart/diagrama/imagen).
+        panel_files: List[tuple] = []  # (filename, seg)
+        for k, seg in enumerate(req.panels):
+            try:
+                data = await _render_panel_bytes(seg)
+                pname = f"panel_{k}.png"
+                with open(os.path.join(job_dir, pname), "wb") as fh:
+                    fh.write(data)
+                panel_files.append((pname, seg))
+            except Exception:
+                continue
+
         W, H, FPS = req.width, req.height, req.fps
         TD = max(0.0, req.transition_duration)
         durations = [max(0.6, it.duration_sec) for it in req.images]
@@ -247,6 +301,8 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             cmd += ["-stream_loop", "-1", "-i", MUSIC_PATH]
         for fname, _seg in mascot_files:
             cmd += ["-stream_loop", "-1", "-i", fname]
+        for pname, _pseg in panel_files:
+            cmd += ["-loop", "1", "-framerate", str(FPS), "-i", pname]
 
         # 5) Filtro por imagen: cover 9:16 + Ken Burns (zoom alternado in/out).
         filters: List[str] = []
@@ -293,9 +349,20 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             filters.append(f"{joined}concat=n={n}:v=1:a=0[cv]")
             last_label = "[cv]"
 
-        # 6b) Overlay de mascota(s) con alfa, sobre las escenas (debajo de subtítulos).
+        # 6b) Overlays: tarjetas de apoyo (centradas) + mascota(s) (esquina), bajo subtítulos.
         base_m = n + (1 if has_audio else 0) + (1 if music_on else 0)
+        base_p = base_m + len(mascot_files)
         cur = last_label
+        for k, (pname, pseg) in enumerate(panel_files):
+            pidx = base_p + k
+            pw = max(2, int(W * pseg.width_frac))
+            py = int(H * pseg.y_frac)
+            filters.append(f"[{pidx}:v]scale={pw}:-1[pn{k}]")
+            out = f"[pp{k}]"
+            filters.append(
+                f"{cur}[pn{k}]overlay=(W-w)/2:{py}:enable='between(t,{pseg.start_sec},{pseg.end_sec})'{out}"
+            )
+            cur = out
         for k, (fname, seg) in enumerate(mascot_files):
             midx = base_m + k
             th = max(2, int(H * seg.scale))
