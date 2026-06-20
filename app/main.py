@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 API_KEY = os.environ.get("MEDIA_WORKER_API_KEY", "").strip()
+PEXELS_KEY = os.environ.get("PEXELS_KEY", "").strip()
 JOBS_DIR = "/tmp/jobs"
 # Voz por defecto: español LatAm (decisión de marca: es-MX-JorgeNeural).
 DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
@@ -116,11 +117,30 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
         (words[-1]["offset_ms"] + words[-1]["duration_ms"]) if words else None
     )
 
+    # Duración REAL del MP3 (ffprobe) — el timing por palabra suele quedar ~corto y
+    # provocaba que -shortest cortara el final de la narración.
+    audio_duration_ms = duration_ms
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "csv=p=0", "-i", "pipe:0",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate(input=audio)
+        val = float(out.decode().strip())
+        if val > 0:
+            audio_duration_ms = val * 1000
+    except Exception:
+        pass
+
     return JSONResponse(
         {
             "mime": "audio/mpeg",
             "audio_b64": base64.b64encode(audio).decode("ascii"),
             "duration_ms": duration_ms,
+            "audio_duration_ms": audio_duration_ms,
             "voice": req.voice,
             "words": words,
         }
@@ -133,6 +153,7 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
 class ImageItem(BaseModel):
     b64: Optional[str] = Field(default=None, description="Imagen en base64.")
     url: Optional[str] = Field(default=None, description="URL de la imagen.")
+    pexels: Optional[str] = Field(default=None, description="Query para buscar una foto real en Pexels (b-roll).")
     duration_sec: float = Field(default=3.0, description="Segundos en pantalla.")
 
 
@@ -183,7 +204,32 @@ class RenderRequest(BaseModel):
     panels: List[Panel] = Field(default_factory=list, description="Tarjetas de apoyo (chart/diagrama/imagen) por escena.")
 
 
+async def _pexels_photo_bytes(query: str) -> Optional[bytes]:
+    """Busca una foto vertical relevante en Pexels y la descarga (b-roll real)."""
+    if not PEXELS_KEY:
+        return None
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            "https://api.pexels.com/v1/search",
+            params={"query": query, "per_page": 8, "orientation": "portrait"},
+            headers={"Authorization": PEXELS_KEY},
+        )
+        r.raise_for_status()
+        photos = r.json().get("photos", [])
+        if not photos:
+            return None
+        src = photos[0]["src"].get("large2x") or photos[0]["src"].get("portrait") or photos[0]["src"].get("large")
+        ir = await client.get(src)
+        ir.raise_for_status()
+        return ir.content
+
+
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
+    if item.pexels:
+        data = await _pexels_photo_bytes(item.pexels)
+        if data:
+            return data
+        # si Pexels falla, cae a b64/url si existen
     if item.b64:
         return base64.b64decode(item.b64)
     if item.url:
@@ -191,7 +237,7 @@ async def _fetch_image_bytes(item: ImageItem) -> bytes:
             resp = await client.get(item.url)
             resp.raise_for_status()
             return resp.content
-    raise HTTPException(status_code=400, detail="Cada imagen requiere 'b64' o 'url'.")
+    raise HTTPException(status_code=400, detail="Cada imagen requiere 'b64', 'url' o 'pexels'.")
 
 
 def _load_font(size: int):
