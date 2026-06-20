@@ -22,6 +22,9 @@ from typing import List, Optional
 import edge_tts
 import httpx
 from PIL import Image, ImageDraw, ImageFont
+from pygments import highlight
+from pygments.lexers import get_lexer_by_name, guess_lexer
+from pygments.formatters import ImageFormatter
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -148,6 +151,8 @@ class Panel(BaseModel):
     """Tarjeta de apoyo (chart/diagrama/imagen) centrada y temporizada por escena."""
     chart: Optional[dict] = Field(default=None, description="Config Chart.js (QuickChart).")
     mermaid: Optional[str] = Field(default=None, description="Código Mermaid (Kroki).")
+    code: Optional[str] = Field(default=None, description="Snippet de código a resaltar (Pygments).")
+    lang: Optional[str] = Field(default=None, description="Lenguaje del código (python, js, ...).")
     title: Optional[str] = Field(default=None, description="Título mostrado en la barra de la tarjeta.")
     url: Optional[str] = Field(default=None, description="URL de una imagen de apoyo.")
     b64: Optional[str] = Field(default=None, description="Imagen de apoyo en base64.")
@@ -233,8 +238,26 @@ def _wrap_card(png_bytes: bytes, title: Optional[str] = None) -> bytes:
     return out.getvalue()
 
 
+def _render_code_png(code: str, lang: Optional[str]) -> bytes:
+    """Resalta un snippet de código a PNG (tema oscuro monokai) con Pygments."""
+    try:
+        lexer = get_lexer_by_name(lang or "text")
+    except Exception:
+        try:
+            lexer = guess_lexer(code)
+        except Exception:
+            lexer = get_lexer_by_name("text")
+    fmt = ImageFormatter(
+        style="monokai", font_size=36, line_numbers=False,
+        image_pad=28, line_pad=8, font_name="DejaVu Sans Mono",
+    )
+    return highlight(code, lexer, fmt)
+
+
 async def _render_panel_bytes(seg: "Panel") -> bytes:
-    """Renderiza una tarjeta de apoyo a PNG: chart (QuickChart), mermaid (Kroki), url o b64."""
+    """Renderiza una tarjeta de apoyo a PNG: code (Pygments), chart (QuickChart), mermaid (Kroki), url o b64."""
+    if seg.code:
+        return _wrap_card(_render_code_png(seg.code, seg.lang), seg.title)
     if seg.b64:
         return base64.b64decode(seg.b64)
     async with httpx.AsyncClient(timeout=45) as client:
