@@ -518,7 +518,7 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
                 pos = f"W-w-{m}:H-h-{m}"
             # Clip "alfa empacado": color arriba, máscara alfa (gris) abajo.
             filters.append(f"[{midx}:v]split=2[c{k}][a{k}]")
-            filters.append(f"[c{k}]crop=iw:ih/2:0:0,eq=saturation=1.6:contrast=1.08[col{k}]")
+            filters.append(f"[c{k}]crop=iw:ih/2:0:0,eq=saturation=2.2:contrast=1.1[col{k}]")
             filters.append(f"[a{k}]crop=iw:ih/2:0:ih/2,format=gray[alp{k}]")
             filters.append(f"[col{k}][alp{k}]alphamerge,scale=-1:{th}[mk{k}]")
             out = f"[mov{k}]"
