@@ -8,6 +8,7 @@ RUN apt-get update \
         ffmpeg \
         fonts-dejavu-core \
         fontconfig \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
