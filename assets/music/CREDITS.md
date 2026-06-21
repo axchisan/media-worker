@@ -1,13 +1,10 @@
-# Créditos de música
+# Créditos de música (CC-BY — atribuir en la descripción del video)
 
-La música de fondo incluida en este repositorio se usa bajo licencia **Creative Commons Attribution 4.0 (CC BY 4.0)**, que **exige atribución**.
+Pistas de Kevin MacLeod (incompetech.com), licencia Creative Commons BY 4.0.
+Mapa de moods (en Supabase cc-mascota/music/), normalizadas a -18 LUFS:
+- chill.mp3      ← "Carefree"          (explicativos/conceptos)
+- tech.mp3       ← "Digital Lemonade"  (IA, código, noticias/tendencias)
+- groovy.mp3     ← "Bossa Antigua"     (peleas/versus/comparativas)
+- inspiring.mp3  ← "Inspired"          (historia de empresas/tecnologías)
 
-| Archivo | Título | Autor | Licencia | Fuente |
-|---|---|---|---|---|
-| `carefree.mp3` | Carefree | Kevin MacLeod | CC BY 4.0 | https://incompetech.com/ |
-
-**Atribución requerida** (incluir en la descripción de cada video que use la pista):
-
-> "Carefree" Kevin MacLeod (incompetech.com) — Licensed under Creative Commons: By Attribution 4.0 — https://creativecommons.org/licenses/by/4.0/
-
-> Nota: si en el futuro se quiere evitar la obligación de atribución, sustituir por una pista **CC0** (dominio público).
+Atribución sugerida: "Music by Kevin MacLeod (incompetech.com) — CC BY 4.0".
