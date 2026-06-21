@@ -35,6 +35,9 @@ API_KEY = os.environ.get("MEDIA_WORKER_API_KEY", "").strip()
 PEXELS_KEY = os.environ.get("PEXELS_KEY", "").strip()
 ELEVENLABS_KEY = os.environ.get("ELEVENLABS_KEY", "").strip()
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+# Azure Speech (voces multilingües con acento nativo vía <lang>). Free tier F0.
+AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "").strip()
+AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "").strip()
 # cc-browser: genera infografías caricaturescas con Gemini web (gratis, sesión del dueño).
 BROWSER_URL = os.environ.get("BROWSER_URL", "https://browser.axchisan.com").strip().rstrip("/")
 BROWSER_API_KEY = os.environ.get("BROWSER_API_KEY", "").strip()
@@ -77,9 +80,10 @@ async def health():
 # --------------------------------------------------------------------------- #
 class TTSRequest(BaseModel):
     text: str = Field(..., description="Texto a narrar.")
-    provider: str = Field(default="edge", description="'edge' (edge-tts) o 'elevenlabs'.")
-    voice: str = Field(default=DEFAULT_VOICE, description="Voz: nombre edge-tts o voice_id de ElevenLabs.")
-    fallback_voice: str = Field(default=DEFAULT_VOICE, description="Voz edge-tts de respaldo si ElevenLabs falla.")
+    provider: str = Field(default="edge", description="'edge' (edge-tts), 'elevenlabs' o 'azure'.")
+    voice: str = Field(default=DEFAULT_VOICE, description="Voz: nombre edge-tts/Azure o voice_id de ElevenLabs.")
+    fallback_voice: str = Field(default=DEFAULT_VOICE, description="Voz edge-tts de respaldo si ElevenLabs/Azure falla.")
+    lang: Optional[str] = Field(default=None, description="Locale para acento nativo en voces multilingües de Azure (ej. 'es-MX'). Envuelve el texto en <lang>.")
     rate: str = Field(default="+0%", description="Velocidad, p.ej. '+10%'.")
     pitch: str = Field(default="+0Hz", description="Tono, p.ej. '+2Hz'.")
     volume: str = Field(default="+0%", description="Volumen, p.ej. '+0%'.")
@@ -163,6 +167,56 @@ async def _elevenlabs_tts(text: str, voice_id: str):
     return audio, words
 
 
+def _azure_tts_sync(text, voice, lang, rate, pitch, key, region):
+    """TTS con Azure Speech (SDK, bloqueante → correr en thread). SSML con <lang> para
+    que las voces multilingües hablen con acento NATIVO. Devuelve (audio_mp3, words[])."""
+    import azure.cognitiveservices.speech as speechsdk
+    from xml.sax.saxutils import escape
+
+    cfg = speechsdk.SpeechConfig(subscription=key, region=region)
+    cfg.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
+    )
+    synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
+
+    words: List[dict] = []
+
+    def _on_wb(evt):
+        t = evt.text or ""
+        if not t.strip():
+            return
+        try:
+            dur_ms = evt.duration.total_seconds() * 1000
+        except Exception:
+            dur_ms = (getattr(evt, "duration", 0) or 0) / 10000
+        words.append({
+            "text": t,
+            "offset_ms": evt.audio_offset / 10000,  # ticks de 100ns → ms
+            "duration_ms": dur_ms,
+        })
+
+    synth.synthesis_word_boundary.connect(_on_wb)
+
+    lang = lang or "es-MX"
+    body = f"<prosody rate='{rate}' pitch='{pitch}'>{escape(text)}</prosody>"
+    inner = f"<lang xml:lang='{lang}'>{body}</lang>"
+    ssml = (
+        f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
+        f"xmlns:mstts='https://www.w3.org/2001/mstts' xml:lang='{lang}'>"
+        f"<voice name='{voice}'>{inner}</voice></speak>"
+    )
+    result = synth.speak_ssml_async(ssml).get()
+    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        detail = ""
+        try:
+            cd = result.cancellation_details
+            detail = f"{cd.reason}: {cd.error_details}"
+        except Exception:
+            detail = str(result.reason)
+        raise RuntimeError(f"Azure TTS no completó: {detail}")
+    return bytes(result.audio_data), words
+
+
 @app.post("/tts")
 async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
     """Genera narración MP3 y devuelve audio (base64) + timing por palabra."""
@@ -173,6 +227,29 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
 
     # Texto a SINTETIZAR con correcciones fonéticas (los subtítulos se restauran luego).
     synth_text = _apply_pron(req.text, req.pron)
+
+    # --- Azure Speech (voces multilingües con acento NATIVO vía <lang>); si falla → edge-tts ---
+    if req.provider == "azure" and AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+        try:
+            audio, az_words = await asyncio.to_thread(
+                _azure_tts_sync, synth_text, req.voice, req.lang,
+                req.rate, req.pitch, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
+            )
+            for w in az_words:
+                w["text"] = _restore_pron_word(w["text"], req.pron)
+            dur_ms = (az_words[-1]["offset_ms"] + az_words[-1]["duration_ms"]) if az_words else None
+            real_ms = await _mp3_duration_ms(audio) or dur_ms
+            return JSONResponse({
+                "mime": "audio/mpeg",
+                "audio_b64": base64.b64encode(audio).decode("ascii"),
+                "duration_ms": dur_ms,
+                "audio_duration_ms": real_ms,
+                "voice": req.voice,
+                "provider": "azure",
+                "words": az_words,
+            })
+        except Exception:
+            pass  # respaldo: edge-tts (con fallback_voice)
 
     # --- ElevenLabs (voz expresiva del canal); si falla (cuota/error) cae a edge-tts ---
     if req.provider == "elevenlabs" and ELEVENLABS_KEY:

@@ -3,12 +3,15 @@
 FROM python:3.12-slim
 
 # FFmpeg + fuentes para subtítulos quemados (ASS). fontconfig para que libass resuelva fuentes.
+# libasound2 + ca-certificates: requeridos por el Azure Speech SDK (TTS multilingüe nativo).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-dejavu-core \
         fontconfig \
         curl \
+        libasound2 \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
