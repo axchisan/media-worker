@@ -15,6 +15,7 @@ import asyncio
 import base64
 import io
 import os
+import re
 import shutil
 import uuid
 from typing import List, Optional
@@ -86,6 +87,29 @@ class TTSRequest(BaseModel):
         default="WordBoundary",
         description="Granularidad del timing: 'WordBoundary' (karaoke) o 'SentenceBoundary'.",
     )
+    pron: Optional[List[List[str]]] = Field(
+        default=None,
+        description="Correcciones de pronunciación [[display, fonetico], ...]: el texto se sintetiza "
+                    "con la forma 'fonetico' (para que la voz lo diga bien) pero el timing se devuelve "
+                    "con la forma 'display' (subtítulos correctos). Ej: [['tecnobichos','tecnobicios']].",
+    )
+
+
+def _apply_pron(text: str, pron) -> str:
+    """Reemplaza display→fonetico para la síntesis (límite de palabra, sin distinguir mayúsculas)."""
+    for pair in pron or []:
+        if len(pair) >= 2 and pair[0]:
+            text = re.sub(rf"\b{re.escape(pair[0])}\b", pair[1], text, flags=re.IGNORECASE)
+    return text
+
+
+def _restore_pron_word(w_text: str, pron) -> str:
+    """Revierte fonetico→display en una palabra del timing (subtítulo correcto)."""
+    core = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", "", w_text)
+    for pair in pron or []:
+        if len(pair) >= 2 and pair[1] and core.lower() == pair[1].lower():
+            return re.sub(re.escape(pair[1]), pair[0], w_text, flags=re.IGNORECASE)
+    return w_text
 
 
 async def _mp3_duration_ms(audio: bytes) -> Optional[float]:
@@ -147,10 +171,15 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="El campo 'text' está vacío.")
 
+    # Texto a SINTETIZAR con correcciones fonéticas (los subtítulos se restauran luego).
+    synth_text = _apply_pron(req.text, req.pron)
+
     # --- ElevenLabs (voz expresiva del canal); si falla (cuota/error) cae a edge-tts ---
     if req.provider == "elevenlabs" and ELEVENLABS_KEY:
         try:
-            audio, el_words = await _elevenlabs_tts(req.text, req.voice)
+            audio, el_words = await _elevenlabs_tts(synth_text, req.voice)
+            for w in el_words:
+                w["text"] = _restore_pron_word(w["text"], req.pron)
             dur_ms = (el_words[-1]["offset_ms"] + el_words[-1]["duration_ms"]) if el_words else None
             real_ms = await _mp3_duration_ms(audio) or dur_ms
             return JSONResponse({
@@ -168,7 +197,7 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
     # edge-tts (modo por defecto o respaldo de ElevenLabs)
     edge_voice = req.voice if req.provider == "edge" else (req.fallback_voice or DEFAULT_VOICE)
     communicate = edge_tts.Communicate(
-        req.text,
+        synth_text,
         voice=edge_voice,
         rate=req.rate,
         pitch=req.pitch,
@@ -186,7 +215,7 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
                 # edge-tts entrega offset/duration en ticks de 100ns.
                 words.append(
                     {
-                        "text": chunk["text"],
+                        "text": _restore_pron_word(chunk["text"], req.pron),
                         "offset_ms": chunk["offset"] / 10000,
                         "duration_ms": chunk["duration"] / 10000,
                     }
