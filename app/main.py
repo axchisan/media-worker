@@ -42,6 +42,11 @@ RENDER_TIMEOUT = int(os.environ.get("RENDER_TIMEOUT", "480"))
 JOBS_DIR = "/tmp/jobs"
 # Voz por defecto: español LatAm (decisión de marca: es-MX-JorgeNeural).
 DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
+
+# Backup/reuso de imágenes generadas (por video) en Supabase Storage.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://db.quanta.axchisan.com").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+BACKUP_BUCKET = os.environ.get("CC_BACKUP_BUCKET", "cc-assets").strip()
 # Música de fondo del canal (CC-BY, ver assets/music/CREDITS.md).
 MUSIC_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "music", "carefree.mp3")
@@ -305,6 +310,7 @@ class RenderRequest(BaseModel):
     music_url: Optional[str] = Field(default=None, description="URL de la pista de música según el mood del tema (si no, usa la pista por defecto).")
     mascots: List[MascotSeg] = Field(default_factory=list, description="Clips de mascota (alfa) a superponer.")
     panels: List[Panel] = Field(default_factory=list, description="Tarjetas de apoyo (chart/diagrama/imagen) por escena.")
+    topic_id: Optional[str] = Field(default=None, description="ID del tema en cc_cola_contenido (backup/reuso de imágenes por video).")
 
 
 async def _pexels_photo_bytes(query: str) -> Optional[bytes]:
@@ -348,10 +354,57 @@ async def _gemini_infographic_bytes(prompt: str) -> Optional[bytes]:
     return None
 
 
-async def _fetch_image_bytes(item: ImageItem) -> bytes:
+async def _storage_download(path: str) -> Optional[bytes]:
+    """Descarga un objeto del bucket de backup (None si no existe / sin credenciales)."""
+    if not SUPABASE_KEY:
+        return None
+    url = f"{SUPABASE_URL}/storage/v1/object/{BACKUP_BUCKET}/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                url, headers={"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY}
+            )
+            if r.status_code == 200 and r.content:
+                return r.content
+    except Exception:
+        pass
+    return None
+
+
+async def _storage_upload(path: str, data: bytes, content_type: str = "image/png") -> bool:
+    """Sube (upsert) un objeto al bucket de backup. Best-effort: no rompe el render si falla."""
+    if not SUPABASE_KEY:
+        return False
+    url = f"{SUPABASE_URL}/storage/v1/object/{BACKUP_BUCKET}/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                url, content=data,
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY,
+                    "Content-Type": content_type, "x-upsert": "true",
+                },
+            )
+            return r.status_code in (200, 201)
+    except Exception:
+        return False
+
+
+async def _fetch_image_bytes(item: ImageItem, topic_id: Optional[str] = None, idx: int = 0) -> bytes:
+    # Reuso de backup: si la imagen Gemini de este video ya se generó antes, se reusa
+    # (re-render por cambio de voz NO regenera gráficos → gratis, rápido y consistente).
+    backup_path = None
+    if item.gemini_prompt and topic_id:
+        backup_path = f"video-{topic_id}/img_{idx:03d}.png"
+        cached = await _storage_download(backup_path)
+        if cached:
+            return cached
     if item.gemini_prompt:
         data = await _gemini_infographic_bytes(item.gemini_prompt)
         if data:
+            # Backup por video: guarda la imagen recién generada para reusos futuros.
+            if backup_path:
+                await _storage_upload(backup_path, data, "image/png")
             return data
         # respaldo: degradado limpio si Gemini/cc-browser falla o se agota la sesión
         return _gradient_bg()
@@ -481,7 +534,7 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
     try:
         # 1) Guardar imágenes.
         for idx, item in enumerate(req.images):
-            data = await _fetch_image_bytes(item)
+            data = await _fetch_image_bytes(item, req.topic_id, idx)
             with open(os.path.join(job_dir, f"img_{idx:03d}.png"), "wb") as fh:
                 fh.write(data)
         n = len(req.images)
