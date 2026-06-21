@@ -51,6 +51,22 @@ DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://db.quanta.axchisan.com").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 BACKUP_BUCKET = os.environ.get("CC_BACKUP_BUCKET", "cc-assets").strip()
+# Sistema central de alertas/logging (webhook n8n cc-alert).
+ALERT_URL = os.environ.get("ALERT_URL", "https://n8n.axchisan.com/webhook/cc-alert").strip()
+
+
+async def _alert(title, detail=None, level="error", context=None, source="media-worker"):
+    """Reporta al webhook central (log a cc_logs + WhatsApp si es error). Best-effort."""
+    if not ALERT_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(ALERT_URL, json={
+                "source": source, "level": level, "title": title,
+                "detail": detail or {}, "context": context,
+            })
+    except Exception:
+        pass
 # Música de fondo del canal (CC-BY, ver assets/music/CREDITS.md).
 MUSIC_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "music", "carefree.mp3")
@@ -456,8 +472,11 @@ async def _gemini_infographic_bytes(prompt: str) -> Optional[bytes]:
             )
             if r.status_code == 200 and r.content:
                 return r.content
-    except Exception:
-        pass
+            await _alert("Gemini no generó imagen — video degradado a fondo plano",
+                         level="warning", detail={"status": r.status_code, "body": r.text[:200]})
+    except Exception as exc:
+        await _alert("cc-browser/Gemini no respondió — video degradado",
+                     level="warning", detail={"error": str(exc)[:200]})
     return None
 
 
@@ -864,12 +883,17 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             except Exception:
                 pass
             cleanup()
+            await _alert("Render excedió el tiempo y fue abortado", level="critical",
+                         detail={"timeout_s": RENDER_TIMEOUT}, context=req.topic_id)
             raise HTTPException(status_code=503, detail="Render excedió el tiempo (recursos); abortado y limpiado.")
 
         out_path = os.path.join(job_dir, "output.mp4")
         if proc.returncode != 0 or not os.path.exists(out_path):
             cleanup()
             tail = stderr.decode("utf-8", "ignore")[-2000:]
+            await _alert("ffmpeg falló en el render", level="error",
+                         detail={"ffmpeg_stderr": tail[-600:], "returncode": proc.returncode},
+                         context=req.topic_id)
             raise HTTPException(status_code=500, detail=f"ffmpeg falló:\n{tail}")
 
         # FileResponse + limpieza diferida del job al terminar el envío.
