@@ -300,6 +300,7 @@ class RenderRequest(BaseModel):
     motion_intensity: float = Field(default=0.12, description="Cuánto zoom del Ken Burns (0.12 = +12%).")
     background_music: bool = Field(default=True, description="Mezclar música de fondo del canal (CC-BY).")
     music_volume: float = Field(default=0.5, description="Volumen de la música respecto a la narración.")
+    music_url: Optional[str] = Field(default=None, description="URL de la pista de música según el mood del tema (si no, usa la pista por defecto).")
     mascots: List[MascotSeg] = Field(default_factory=list, description="Clips de mascota (alfa) a superponer.")
     panels: List[Panel] = Field(default_factory=list, description="Tarjetas de apoyo (chart/diagrama/imagen) por escena.")
 
@@ -541,9 +542,21 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             ]
         if has_audio:
             cmd += ["-i", "audio.mp3"]
-        music_on = req.background_music and os.path.exists(MUSIC_PATH)
+        # Música: pista por mood (music_url) si viene; si no, la del canal por defecto.
+        music_path = MUSIC_PATH
+        if req.background_music and req.music_url:
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    mr = await client.get(req.music_url)
+                    if mr.status_code == 200 and mr.content:
+                        music_path = os.path.join(job_dir, "music.mp3")
+                        with open(music_path, "wb") as fh:
+                            fh.write(mr.content)
+            except Exception:
+                music_path = MUSIC_PATH  # respaldo: pista por defecto
+        music_on = req.background_music and os.path.exists(music_path)
         if music_on:
-            cmd += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+            cmd += ["-stream_loop", "-1", "-i", music_path]
         # Acotar los inputs de overlay (infinitos) a la duración total para no colgar sin audio.
         total_in = sum(durations)
         for fname, _seg in mascot_files:
