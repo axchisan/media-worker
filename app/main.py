@@ -563,6 +563,29 @@ def _load_font(size: int):
     return ImageFont.load_default()
 
 
+def _make_thumbnail(png_bytes: bytes, w: int = 1280, h: int = 720) -> bytes:
+    """Miniatura YouTube 16:9 desde la portada 9:16: fondo cubierto+desenfocado+oscurecido
+    con la portada (que ya trae el título) contenida y centrada encima."""
+    src = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    sw, sh = src.size
+    # Fondo: cubrir el lienzo (crop centrado) + desenfoque + oscurecer.
+    scale = max(w / sw, h / sh)
+    bg = src.resize((max(1, int(sw * scale)), max(1, int(sh * scale))), Image.LANCZOS)
+    bx = (bg.width - w) // 2
+    by = (bg.height - h) // 2
+    bg = bg.crop((bx, by, bx + w, by + h)).filter(ImageFilter.GaussianBlur(30))
+    bg = Image.eval(bg, lambda p: int(p * 0.5))
+    # Primer plano: portada contenida (ajusta a la altura), centrada.
+    fscale = (h - 36) / sh
+    fg = src.resize((max(1, int(sw * fscale)), max(1, int(sh * fscale))), Image.LANCZOS)
+    fx = (w - fg.width) // 2
+    fy = (h - fg.height) // 2
+    bg.paste(fg, (fx, fy))
+    out = io.BytesIO()
+    bg.convert("RGB").save(out, format="JPEG", quality=88)
+    return out.getvalue()
+
+
 def _wrap_card(png_bytes: bytes, title: Optional[str] = None) -> bytes:
     """Envuelve un PNG en una tarjeta blanca redondeada con barra de marca y título (legibilidad/coherencia)."""
     img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
@@ -895,6 +918,17 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
                          detail={"ffmpeg_stderr": tail[-600:], "returncode": proc.returncode},
                          context=req.topic_id)
             raise HTTPException(status_code=500, detail=f"ffmpeg falló:\n{tail}")
+
+        # Miniatura 16:9 para YouTube (desde la portada) → backup por video.
+        if req.topic_id:
+            try:
+                first_img = os.path.join(job_dir, "img_000.png")
+                if os.path.exists(first_img):
+                    with open(first_img, "rb") as fh:
+                        thumb = _make_thumbnail(fh.read())
+                    await _storage_upload(f"video-{req.topic_id}/thumb.jpg", thumb, "image/jpeg")
+            except Exception:
+                pass
 
         # FileResponse + limpieza diferida del job al terminar el envío.
         return FileResponse(
