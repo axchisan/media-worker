@@ -37,6 +37,8 @@ ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 # cc-browser: genera infografías caricaturescas con Gemini web (gratis, sesión del dueño).
 BROWSER_URL = os.environ.get("BROWSER_URL", "https://browser.axchisan.com").strip().rstrip("/")
 BROWSER_API_KEY = os.environ.get("BROWSER_API_KEY", "").strip()
+# Tope duro de ffmpeg (s): si se cuelga/thrashea, se mata para no dejar zombies.
+RENDER_TIMEOUT = int(os.environ.get("RENDER_TIMEOUT", "480"))
 JOBS_DIR = "/tmp/jobs"
 # Voz por defecto: español LatAm (decisión de marca: es-MX-JorgeNeural).
 DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
@@ -691,7 +693,18 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        # Tope duro: si ffmpeg se cuelga/thrashea, lo matamos (evita procesos zombie
+        # que se acumulan y tumban los renders siguientes por falta de RAM).
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=RENDER_TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.communicate(), timeout=10)
+            except Exception:
+                pass
+            cleanup()
+            raise HTTPException(status_code=503, detail="Render excedió el tiempo (recursos); abortado y limpiado.")
 
         out_path = os.path.join(job_dir, "output.mp4")
         if proc.returncode != 0 or not os.path.exists(out_path):
