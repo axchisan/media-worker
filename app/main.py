@@ -183,7 +183,8 @@ def _azure_tts_sync(text, voice, lang, rate, pitch, key, region):
 
     def _on_wb(evt):
         t = evt.text or ""
-        if not t.strip():
+        # Azure emite la puntuación (¡ ! ¿ ? , .) como tokens sueltos → fuera de los subtítulos.
+        if not any(c.isalnum() for c in t):
             return
         try:
             dur_ms = evt.duration.total_seconds() * 1000
