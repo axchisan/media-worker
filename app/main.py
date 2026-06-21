@@ -574,10 +574,12 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
                     zexpr = f"min(1+on*{k:.6f},{1 + req.motion_intensity:.3f})"
                 else:
                     zexpr = f"max({1 + req.motion_intensity:.3f}-on*{k:.6f},1.0)"
-                # Headroom de zoom 2x (calidad full; AWS tiene RAM de sobra).
+                # Headroom de zoom 1.25x: suficiente para el Ken Burns (~8%) y mucho
+                # más liviano que 2x (frames 4x menores) -> render estable en 2 vCPU.
+                sw, sh = int(W * 1.25), int(H * 1.25)
                 filt = (
-                    f"[{idx}:v]scale={W*2}:{H*2}:force_original_aspect_ratio=increase,"
-                    f"crop={W*2}:{H*2},"
+                    f"[{idx}:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                    f"crop={sw}:{sh},"
                     f"zoompan=z='{zexpr}':d=1:s={W}x{H}:fps={FPS}:"
                     f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
                     f"setsar=1,format=yuv420p[v{idx}]"
