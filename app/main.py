@@ -68,6 +68,7 @@ class TTSRequest(BaseModel):
     text: str = Field(..., description="Texto a narrar.")
     provider: str = Field(default="edge", description="'edge' (edge-tts) o 'elevenlabs'.")
     voice: str = Field(default=DEFAULT_VOICE, description="Voz: nombre edge-tts o voice_id de ElevenLabs.")
+    fallback_voice: str = Field(default=DEFAULT_VOICE, description="Voz edge-tts de respaldo si ElevenLabs falla.")
     rate: str = Field(default="+0%", description="Velocidad, p.ej. '+10%'.")
     pitch: str = Field(default="+0Hz", description="Tono, p.ej. '+2Hz'.")
     volume: str = Field(default="+0%", description="Volumen, p.ej. '+0%'.")
@@ -136,26 +137,29 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="El campo 'text' está vacío.")
 
-    # --- ElevenLabs (voz expresiva del canal) ---
+    # --- ElevenLabs (voz expresiva del canal); si falla (cuota/error) cae a edge-tts ---
     if req.provider == "elevenlabs" and ELEVENLABS_KEY:
         try:
             audio, el_words = await _elevenlabs_tts(req.text, req.voice)
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Fallo en ElevenLabs: {exc}")
-        dur_ms = (el_words[-1]["offset_ms"] + el_words[-1]["duration_ms"]) if el_words else None
-        real_ms = await _mp3_duration_ms(audio) or dur_ms
-        return JSONResponse({
-            "mime": "audio/mpeg",
-            "audio_b64": base64.b64encode(audio).decode("ascii"),
-            "duration_ms": dur_ms,
-            "audio_duration_ms": real_ms,
-            "voice": req.voice,
-            "words": el_words,
-        })
+            dur_ms = (el_words[-1]["offset_ms"] + el_words[-1]["duration_ms"]) if el_words else None
+            real_ms = await _mp3_duration_ms(audio) or dur_ms
+            return JSONResponse({
+                "mime": "audio/mpeg",
+                "audio_b64": base64.b64encode(audio).decode("ascii"),
+                "duration_ms": dur_ms,
+                "audio_duration_ms": real_ms,
+                "voice": req.voice,
+                "provider": "elevenlabs",
+                "words": el_words,
+            })
+        except Exception:
+            pass  # respaldo: edge-tts
 
+    # edge-tts (modo por defecto o respaldo de ElevenLabs)
+    edge_voice = req.voice if req.provider == "edge" else (req.fallback_voice or DEFAULT_VOICE)
     communicate = edge_tts.Communicate(
         req.text,
-        voice=req.voice,
+        voice=edge_voice,
         rate=req.rate,
         pitch=req.pitch,
         volume=req.volume,
