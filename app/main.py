@@ -34,6 +34,9 @@ API_KEY = os.environ.get("MEDIA_WORKER_API_KEY", "").strip()
 PEXELS_KEY = os.environ.get("PEXELS_KEY", "").strip()
 ELEVENLABS_KEY = os.environ.get("ELEVENLABS_KEY", "").strip()
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+# cc-browser: genera infografías caricaturescas con Gemini web (gratis, sesión del dueño).
+BROWSER_URL = os.environ.get("BROWSER_URL", "https://browser.axchisan.com").strip().rstrip("/")
+BROWSER_API_KEY = os.environ.get("BROWSER_API_KEY", "").strip()
 JOBS_DIR = "/tmp/jobs"
 # Voz por defecto: español LatAm (decisión de marca: es-MX-JorgeNeural).
 DEFAULT_VOICE = os.environ.get("DEFAULT_TTS_VOICE", "es-MX-JorgeNeural")
@@ -230,6 +233,7 @@ class ImageItem(BaseModel):
     url: Optional[str] = Field(default=None, description="URL de la imagen.")
     pexels: Optional[str] = Field(default=None, description="Query para buscar una foto real en Pexels (b-roll).")
     gradient: Optional[bool] = Field(default=None, description="Generar un fondo degradado limpio de marca.")
+    gemini_prompt: Optional[str] = Field(default=None, description="Prompt para generar una infografía caricaturesca con Gemini (cc-browser).")
     duration_sec: float = Field(default=3.0, description="Segundos en pantalla.")
 
 
@@ -320,7 +324,34 @@ async def _pexels_photo_bytes(query: str) -> Optional[bytes]:
         return ir.content
 
 
+async def _gemini_infographic_bytes(prompt: str) -> Optional[bytes]:
+    """Pide a cc-browser una infografía caricaturesca generada con Gemini web."""
+    if not BROWSER_URL:
+        return None
+    headers = {"Content-Type": "application/json"}
+    if BROWSER_API_KEY:
+        headers["X-API-Key"] = BROWSER_API_KEY
+    try:
+        async with httpx.AsyncClient(timeout=210) as client:
+            r = await client.post(
+                f"{BROWSER_URL}/gen-image",
+                json={"prompt": prompt, "timeout_s": 180},
+                headers=headers,
+            )
+            if r.status_code == 200 and r.content:
+                return r.content
+    except Exception:
+        pass
+    return None
+
+
 async def _fetch_image_bytes(item: ImageItem) -> bytes:
+    if item.gemini_prompt:
+        data = await _gemini_infographic_bytes(item.gemini_prompt)
+        if data:
+            return data
+        # respaldo: degradado limpio si Gemini/cc-browser falla o se agota la sesión
+        return _gradient_bg()
     if item.gradient:
         return _gradient_bg()
     if item.pexels:
