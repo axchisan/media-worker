@@ -299,7 +299,7 @@ class RenderRequest(BaseModel):
     ken_burns: bool = Field(default=True, description="Movimiento Ken Burns (zoom/pan lento).")
     motion_intensity: float = Field(default=0.12, description="Cuánto zoom del Ken Burns (0.12 = +12%).")
     background_music: bool = Field(default=True, description="Mezclar música de fondo del canal (CC-BY).")
-    music_volume: float = Field(default=0.18, description="Volumen de la música respecto a la narración.")
+    music_volume: float = Field(default=0.5, description="Volumen de la música respecto a la narración.")
     mascots: List[MascotSeg] = Field(default_factory=list, description="Clips de mascota (alfa) a superponer.")
     panels: List[Panel] = Field(default_factory=list, description="Tarjetas de apoyo (chart/diagrama/imagen) por escena.")
 
@@ -642,13 +642,17 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
         else:
             filters.append(f"{last_label}null[vout]")
 
-        # 8) Audio: narración + música de fondo (volumen bajo) vía amix.
+        # 8) Audio: narración + música de fondo con DUCKING (sidechain).
+        #    La música suena a buen nivel y se agacha sola cuando habla la voz,
+        #    quedando clara en los silencios sin tapar la narración.
         music_idx = (n + 1) if has_audio else n
         audio_map: Optional[str] = None
         if has_audio and music_on:
             filters.append(
-                f"[{music_idx}:a]volume={req.music_volume}[mus];"
-                f"[{n}:a][mus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+                f"[{n}:a]asplit=2[vmix][vsc];"
+                f"[{music_idx}:a]volume={req.music_volume}[mus0];"
+                f"[mus0][vsc]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=320[musd];"
+                f"[vmix][musd]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
             )
             audio_map = "[aout]"
         elif has_audio:
