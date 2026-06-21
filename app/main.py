@@ -574,9 +574,12 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
                     zexpr = f"min(1+on*{k:.6f},{1 + req.motion_intensity:.3f})"
                 else:
                     zexpr = f"max({1 + req.motion_intensity:.3f}-on*{k:.6f},1.0)"
+                # Headroom de zoom modesto (1.25x) en vez de 2x: el Ken Burns solo
+                # zoomea ~8%, así que 2x desperdiciaba RAM (frames gigantes -> swap).
+                sw, sh = int(W * 1.25), int(H * 1.25)
                 filt = (
-                    f"[{idx}:v]scale={W*2}:{H*2}:force_original_aspect_ratio=increase,"
-                    f"crop={W*2}:{H*2},"
+                    f"[{idx}:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                    f"crop={sw}:{sh},"
                     f"zoompan=z='{zexpr}':d=1:s={W}x{H}:fps={FPS}:"
                     f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
                     f"setsar=1,format=yuv420p[v{idx}]"
@@ -679,6 +682,7 @@ async def render(req: RenderRequest, x_api_key: Optional[str] = Header(default=N
             cmd += ["-map", audio_map, "-c:a", "aac", "-b:a", "128k", "-shortest"]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-threads", "2",  # acota CPU/RAM en el VPS (RAM justa, evita swap-thrashing)
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "output.mp4",
         ]
 
