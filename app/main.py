@@ -532,8 +532,12 @@ async def _fetch_image_bytes(item: ImageItem, topic_id: Optional[str] = None, id
             if backup_path:
                 await _storage_upload(backup_path, data, "image/png")
             return data
-        # respaldo: degradado limpio si Gemini/cc-browser falla o se agota la sesión
-        return _gradient_bg()
+        # Gemini falló: ABORTAR el render. NO producimos video sin infografía (regla del dueño:
+        # "no me sirven videos sin eso"). El pipeline marca el tema para reintento + alerta.
+        await _alert("Render abortado: Gemini no generó la infografía", level="error",
+                     detail={"motivo": "sesion Gemini caida/limite; no se produce video degradado"},
+                     context=topic_id)
+        raise HTTPException(status_code=502, detail="Gemini no disponible — render abortado (no se produce video sin infografía).")
     if item.gradient:
         return _gradient_bg()
     if item.pexels:
