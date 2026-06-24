@@ -217,10 +217,19 @@ def _azure_tts_sync(text, voice, lang, rate, pitch, key, region):
     lang = lang or "es-MX"
     body = f"<prosody rate='{rate}' pitch='{pitch}'>{escape(text)}</prosody>"
     inner = f"<lang xml:lang='{lang}'>{body}</lang>"
+    # Recortar los silencios que las voces multilingües meten en comas/fin de frase
+    # (sonaban "trabadas, como pensando"). Leading/Tailing a 0 → concatenación de
+    # escenas/turnos sin huecos. Sentenceboundary y coma reducidos → habla más fluida.
+    silence = (
+        "<mstts:silence type='Leading-exact' value='0ms'/>"
+        "<mstts:silence type='Tailing-exact' value='0ms'/>"
+        "<mstts:silence type='Sentenceboundary-exact' value='80ms'/>"
+        "<mstts:silence type='Comma-exact' value='60ms'/>"
+    )
     ssml = (
         f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
         f"xmlns:mstts='https://www.w3.org/2001/mstts' xml:lang='{lang}'>"
-        f"<voice name='{voice}'>{inner}</voice></speak>"
+        f"<voice name='{voice}'>{silence}{inner}</voice></speak>"
     )
     result = synth.speak_ssml_async(ssml).get()
     if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
@@ -336,6 +345,78 @@ async def tts_dialogue(req: DialogueRequest, x_api_key: Optional[str] = Header(d
             "words": all_words,
             "turns": turn_meta,
             "provider": "dialogue",
+        })
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+class ScenesRequest(BaseModel):
+    scenes: List[str] = Field(..., description="Narración por escena, en orden (UNA voz).")
+    provider: str = "azure"
+    voice: str = ""
+    lang: Optional[str] = "es-MX"
+    rate: str = "+0%"
+    pitch: str = "+0Hz"
+    fallback_voice: str = ""
+
+
+@app.post("/tts-scenes")
+async def tts_scenes(req: ScenesRequest, x_api_key: Optional[str] = Header(default=None)):
+    """Sintetiza la narración POR ESCENA (una sola voz), concatenada. Devuelve audio + words
+    (offsets globales) + scenes (start_sec/end_sec por escena) para sincronizar cada imagen
+    con el momento exacto en que la charla habla de esa escena."""
+    _check_auth(x_api_key)
+    scenes = [(s or "").strip() for s in req.scenes]
+    if not any(scenes):
+        raise HTTPException(status_code=400, detail="scenes vacío.")
+    work = os.path.join(JOBS_DIR, "scn_" + uuid.uuid4().hex)
+    os.makedirs(work, exist_ok=True)
+    try:
+        seg_files: List[str] = []
+        all_words: List[dict] = []
+        scene_meta: List[dict] = []
+        cum = 0.0
+        for i, text in enumerate(scenes):
+            audio, words = ((b"", []) if not text else await _synth_one(
+                text, req.provider, req.voice, req.lang, req.rate, req.pitch, req.fallback_voice))
+            if not audio:
+                # Mantener el índice de escena aunque falle (la imagen no desaparece;
+                # toma ~0s aquí y hereda tiempo de su vecina al repartir en el Build).
+                scene_meta.append({"start_sec": round(cum / 1000, 2), "end_sec": round(cum / 1000, 2)})
+                continue
+            fp = os.path.join(work, f"s{i:03d}.mp3")
+            with open(fp, "wb") as fh:
+                fh.write(audio)
+            seg_files.append(fp)
+            dur = await _mp3_duration_ms(audio) or ((words[-1]["offset_ms"] + words[-1]["duration_ms"]) if words else 0.0)
+            for w in words:
+                all_words.append({"text": w["text"], "offset_ms": w["offset_ms"] + cum, "duration_ms": w["duration_ms"]})
+            scene_meta.append({"start_sec": round(cum / 1000, 2), "end_sec": round((cum + dur) / 1000, 2)})
+            cum += dur
+        if not seg_files:
+            raise HTTPException(status_code=502, detail="Las escenas no produjeron audio.")
+        out = os.path.join(work, "out.mp3")
+        if len(seg_files) == 1:
+            shutil.copy(seg_files[0], out)
+        else:
+            cmd = ["ffmpeg", "-y"]
+            for fp in seg_files:
+                cmd += ["-i", fp]
+            fc = "".join(f"[{i}:a]" for i in range(len(seg_files))) + f"concat=n={len(seg_files)}:v=0:a=1[o]"
+            cmd += ["-filter_complex", fc, "-map", "[o]", "-c:a", "libmp3lame", "-b:a", "128k", out]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await proc.communicate()
+        with open(out, "rb") as fh:
+            audio = fh.read()
+        real_ms = await _mp3_duration_ms(audio) or cum
+        return JSONResponse({
+            "mime": "audio/mpeg",
+            "audio_b64": base64.b64encode(audio).decode("ascii"),
+            "duration_ms": cum,
+            "audio_duration_ms": real_ms,
+            "words": all_words,
+            "scenes": scene_meta,
+            "provider": "scenes",
         })
     finally:
         shutil.rmtree(work, ignore_errors=True)
