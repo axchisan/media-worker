@@ -234,6 +234,97 @@ def _azure_tts_sync(text, voice, lang, rate, pitch, key, region):
     return bytes(result.audio_data), words
 
 
+async def _synth_one(text, provider, voice, lang, rate, pitch, fallback_voice):
+    """Sintetiza UN texto con la voz dada (azure→elevenlabs→edge). Devuelve (audio_bytes, words)."""
+    text = (text or "").strip()
+    if not text:
+        return b"", []
+    if provider == "azure" and AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+        try:
+            return await asyncio.to_thread(
+                _azure_tts_sync, text, voice, lang, rate, pitch, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+        except Exception:
+            pass
+    if provider == "elevenlabs" and ELEVENLABS_KEY:
+        try:
+            return await _elevenlabs_tts(text, voice)
+        except Exception:
+            pass
+    edge_voice = voice if provider == "edge" else (fallback_voice or DEFAULT_VOICE)
+    comm = edge_tts.Communicate(text, voice=edge_voice, rate=rate or "+0%", pitch=pitch or "+0Hz")
+    chunks: List[bytes] = []
+    words: List[dict] = []
+    async for ch in comm.stream():
+        if ch["type"] == "audio":
+            chunks.append(ch["data"])
+        elif ch["type"] in ("WordBoundary", "SentenceBoundary"):
+            words.append({"text": ch["text"], "offset_ms": ch["offset"] / 10000, "duration_ms": ch["duration"] / 10000})
+    return b"".join(chunks), words
+
+
+class DialogueRequest(BaseModel):
+    turns: List[dict] = Field(..., description="Turnos del debate: [{mascota, text, provider, voice, lang, rate, pitch, fallback_voice}].")
+
+
+@app.post("/tts-dialogue")
+async def tts_dialogue(req: DialogueRequest, x_api_key: Optional[str] = Header(default=None)):
+    """Sintetiza un DIÁLOGO: cada turno con su propia voz, concatenados. Devuelve audio + words
+    (offsets globales) + turns (start_sec/end_sec por mascota, para sincronizar la animación)."""
+    _check_auth(x_api_key)
+    if not req.turns:
+        raise HTTPException(status_code=400, detail="turns vacío.")
+    work = os.path.join(JOBS_DIR, "dlg_" + uuid.uuid4().hex)
+    os.makedirs(work, exist_ok=True)
+    try:
+        seg_files: List[str] = []
+        all_words: List[dict] = []
+        turn_meta: List[dict] = []
+        cum = 0.0
+        for i, t in enumerate(req.turns):
+            audio, words = await _synth_one(
+                t.get("text", ""), t.get("provider", "azure"), t.get("voice", ""),
+                t.get("lang", "es-MX"), t.get("rate", "+0%"), t.get("pitch", "+0Hz"),
+                t.get("fallback_voice", ""))
+            if not audio:
+                continue
+            fp = os.path.join(work, f"s{i:03d}.mp3")
+            with open(fp, "wb") as fh:
+                fh.write(audio)
+            seg_files.append(fp)
+            dur = await _mp3_duration_ms(audio) or ((words[-1]["offset_ms"] + words[-1]["duration_ms"]) if words else 0.0)
+            for w in words:
+                all_words.append({"text": w["text"], "offset_ms": w["offset_ms"] + cum, "duration_ms": w["duration_ms"]})
+            turn_meta.append({"mascota": t.get("mascota"), "start_sec": round(cum / 1000, 2), "end_sec": round((cum + dur) / 1000, 2)})
+            cum += dur
+        if not seg_files:
+            raise HTTPException(status_code=502, detail="El diálogo no produjo audio.")
+        out = os.path.join(work, "out.mp3")
+        if len(seg_files) == 1:
+            shutil.copy(seg_files[0], out)
+        else:
+            cmd = ["ffmpeg", "-y"]
+            for fp in seg_files:
+                cmd += ["-i", fp]
+            fc = "".join(f"[{i}:a]" for i in range(len(seg_files))) + f"concat=n={len(seg_files)}:v=0:a=1[o]"
+            cmd += ["-filter_complex", fc, "-map", "[o]", "-c:a", "libmp3lame", "-b:a", "128k", out]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await proc.communicate()
+        with open(out, "rb") as fh:
+            audio = fh.read()
+        real_ms = await _mp3_duration_ms(audio) or cum
+        return JSONResponse({
+            "mime": "audio/mpeg",
+            "audio_b64": base64.b64encode(audio).decode("ascii"),
+            "duration_ms": cum,
+            "audio_duration_ms": real_ms,
+            "words": all_words,
+            "turns": turn_meta,
+            "provider": "dialogue",
+        })
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @app.post("/tts")
 async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
     """Genera narración MP3 y devuelve audio (base64) + timing por palabra."""
