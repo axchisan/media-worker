@@ -276,7 +276,9 @@ async def _synth_one(text, provider, voice, lang, rate, pitch, fallback_voice):
             async for ch in comm.stream():
                 if ch["type"] == "audio":
                     chunks.append(ch["data"])
-                elif ch["type"] in ("WordBoundary", "SentenceBoundary"):
+                elif ch["type"] == "WordBoundary":
+                    # SOLO palabras: los SentenceBoundary de edge traen la frase ENTERA
+                    # como un token → el karaoke los pintaba como bloque gigante.
                     words.append({"text": ch["text"], "offset_ms": ch["offset"] / 10000, "duration_ms": ch["duration"] / 10000})
             audio = b"".join(chunks)
             if audio:
@@ -493,7 +495,8 @@ async def tts(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_chunks.append(chunk["data"])
-            elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+            elif chunk["type"] == "WordBoundary":
+                # SOLO palabras (no SentenceBoundary, que trae la frase entera y rompe el karaoke).
                 # edge-tts entrega offset/duration en ticks de 100ns.
                 words.append(
                     {
