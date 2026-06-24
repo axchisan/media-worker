@@ -240,26 +240,42 @@ async def _synth_one(text, provider, voice, lang, rate, pitch, fallback_voice):
     if not text:
         return b"", []
     if provider == "azure" and AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
-        try:
-            return await asyncio.to_thread(
-                _azure_tts_sync, text, voice, lang, rate, pitch, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
-        except Exception:
-            pass
+        # Reintentar Azure: la PRIMERA llamada del batch a veces falla por cold-start/
+        # handshake y, al tragarse el error, se perdía el turno en silencio (bug debate).
+        for attempt in range(3):
+            try:
+                audio, words = await asyncio.to_thread(
+                    _azure_tts_sync, text, voice, lang, rate, pitch, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+                if audio:
+                    return audio, words
+            except Exception:
+                pass
+            await asyncio.sleep(0.6 * (attempt + 1))
     if provider == "elevenlabs" and ELEVENLABS_KEY:
         try:
             return await _elevenlabs_tts(text, voice)
         except Exception:
             pass
+    # Fallback edge (voz de respaldo de la mascota). También con reintento para no
+    # devolver audio vacío y dejar el turno mudo.
     edge_voice = voice if provider == "edge" else (fallback_voice or DEFAULT_VOICE)
-    comm = edge_tts.Communicate(text, voice=edge_voice, rate=rate or "+0%", pitch=pitch or "+0Hz")
-    chunks: List[bytes] = []
-    words: List[dict] = []
-    async for ch in comm.stream():
-        if ch["type"] == "audio":
-            chunks.append(ch["data"])
-        elif ch["type"] in ("WordBoundary", "SentenceBoundary"):
-            words.append({"text": ch["text"], "offset_ms": ch["offset"] / 10000, "duration_ms": ch["duration"] / 10000})
-    return b"".join(chunks), words
+    for attempt in range(2):
+        try:
+            comm = edge_tts.Communicate(text, voice=edge_voice, rate=rate or "+0%", pitch=pitch or "+0Hz")
+            chunks: List[bytes] = []
+            words: List[dict] = []
+            async for ch in comm.stream():
+                if ch["type"] == "audio":
+                    chunks.append(ch["data"])
+                elif ch["type"] in ("WordBoundary", "SentenceBoundary"):
+                    words.append({"text": ch["text"], "offset_ms": ch["offset"] / 10000, "duration_ms": ch["duration"] / 10000})
+            audio = b"".join(chunks)
+            if audio:
+                return audio, words
+        except Exception:
+            pass
+        await asyncio.sleep(0.6)
+    return b"", []
 
 
 class DialogueRequest(BaseModel):
